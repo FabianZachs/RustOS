@@ -238,3 +238,204 @@ runner = "bootimage runner"
 * The `runner` key specifies the command should be invoked for `cargo run`, which is run after a successful build with the executable files path passed as the first argument. `bootimage runner` is specifically designed to be used as a `runner` executable. It links the given executable with the project's bootloader dependency and then launches QEMU
 
 * Everything works with `cargo xrun` or `cargo xbuild`
+
+## VGA Text Mode
+* VGA text mode is a simple way to print text to the screen. We will make an interface that such that it's usage is safe, by encapsulating all unsafety in a seperate module.
+
+## The VGA Text Buffer
+* To display a character to the screen in VGA text mode, we need to write it to the text buffer of the VGA hardware. 
+* The VGA text buffer is 2D (25x80 typically), which is directly rendered on the screen. Each entry in the array defines a single character, through the following format
+
+Bit(s) | Value
+------ | ----------------
+0-7    | ASCII code point (not exactly ASCII, instead a character set named [code page 437](https://en.wikipedia.org/wiki/Code_page_437))
+8-11   | Foreground color (4 bits)
+12-14  | Background color (3 bits)
+15     | Blink (whether the character should blink) (1 bit)
+
+* 4 bits can be represented as 1 hex (up to 15 dec)
+
+Number | Color      | Number + Bright Bit | Bright Color
+------ | ---------- | ------------------- | -------------
+0x0    | Black      | 0x8                 | Dark Gray
+0x1    | Blue       | 0x9                 | Light Blue
+0x2    | Green      | 0xa                 | Light Green
+0x3    | Cyan       | 0xb                 | Light Cyan
+0x4    | Red        | 0xc                 | Light Red
+0x5    | Magenta    | 0xd                 | Pink
+0x6    | Brown      | 0xe                 | Yellow
+0x7    | Light Gray | 0xf                 | White
+
+* First 3 bits of foreground color are for base color, next bit is the bright bit
+
+* The VGA text buffer is accessible via **memory-mapped I/O** (MMIO) to address `0xb8000`. So reads and writes to that address don't access the RAM, but directly the text buffer on the VGA hardware. So we can read/write to it through normal memory operations to the address.
+* Memory mapped I/O uses the same address space to address both memory and I/O devices. The memory and registers of the I/O devices are mapped to address values. So CPU instructions to access memory can also be used to access devices. Areas of the addresses used by the CPU must be reserved for I/O and not for normal physical memory. I/O devices monitor the CPU's address bus and responds to any CPU access of an address assigned to that device, connecting the data bus to the device's hardware register.
+* Decoders on the I/O device (and main memory) detect when the address is in its required range.
+
+
+## A Rust Module
+* Let's create a rust module to handle printing: We add `mod vga_buffer` to `src/main` and create a `src/vga_buffer.rs` file.
+* We create foundational structs to create a VGA writer.
+
+* We are now able to write to the VGA buffer using the `vga_buffer::Writer`
+
+### Volatile
+* We are writing the the VGA buffer at address `0xb8000`, however, we never read from this location. The compiler doesn't know that we are accessing the VGA buffer memory (instead of normal RAM). It doesnt know that writing to this location has a side effect of printing characters onto the screen. So it may assume these writes are unnecessary, and can thus be omitted. To avoid this optimisation, we specify these writes as **volatile** (indicates the value may change between different accesses, even if it doesnt appear to be modified. It prevents the compiler from optimizing away subsequent reads/writes and thus incorrectly reusing a stale value or omitting writes). 
+* We use the **volatile** crate which provides a `Volatile` wrapper type with `read` and `write` methods. Internally, these methods use the `read_volatile` abd `write_volatile` functions in the core library, thus guarenteeing the reads/writes wont be optimized away.
+* We add `volatile = "0.2.6"` dependency to `cargo.toml` and update out `Buffer` struct in `vga_buffer.rs`. `Volatile<ScreenChar>` is stored in out `buffer` struct instead. `Volatile` is a wrapper that takes almost any type. Then when we write to the buffer, we have to use the `write` method (instead of doing array access).
+
+### Formatting Macros
+* Rust's formatting macros allow us to easily print different types like integers and floats. To support them, we need to implement the `core::fmt::Write` trait (a collection of methods that are required to format a message into a stream).
+* The only required method of this trate is `write_str`. The parameters look similar to the ones we used to implement `write_string`, so we can just use that:
+
+```rust
+use core::fmt;
+
+impl fmt::Write for Writer {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.write_string(s);
+        Ok(())
+    }
+}
+```
+* Now we can the `write!` macro, by passing in our `Writer` instance. Remember to `use core::fmt::Write` for the `write!` macro.
+
+### Newlines
+* When we need to start a new line, our `writer` calls `new_line`. Our implementation will, move every character one line up, (deleting the top line) and continue writing at the last line again.
+
+
+## A Global Interface
+* We need a global writer that can be used as an interface from other modules without carrying a `Writer` instance around. We can create a static writer. 
+```rust
+pub static WRITER: Writer = Writer {
+    column_position: 0,
+    color_code: ColorCode::new(Color::Yellow, Color::Black),
+    buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+};
+```
+* However, statics are initialised at compile time (vs variables which are initialised at runtime). The [const evaluator](https://rustc-dev-guide.rust-lang.org/const-eval.html). However, when compiling we get an error like:
+
+```
+error[E0015]: calls in statics are limited to constant functions, tuple structs and tuple variants
+ --> src/vga_buffer.rs:7:17
+  |
+7 |     color_code: ColorCode::new(Color::Yellow, Color::Black),
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+```
+* `Color::new` could be used if we used a [const function](https://doc.rust-lang.org/unstable-book/language-features/const-fn.html). But the fundamental issues is:
+
+```
+error[E0396]: raw pointers cannot be dereferenced in statics
+ --> src/vga_buffer.rs:8:22
+  |
+8 |     buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+  |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ dereference of raw pointer in constant
+```
+* Rust's const evaluator cannot convert raw ponters to references at compile time.
+
+### Lazy Statics
+* The [lazy\_static](https://docs.rs/lazy_static/1.0.1/lazy_static/) crate provides a `lazy_static!` macro that defines a lazily initialized `static`. The `static` lazily initializes itself when it's accessed the first time (as opposed to at compile time for cormal statics). So the initialization happens at runtime
+* We add it to our `cargo.toml`
+
+```
+[dependencies.lazy_static]
+version = "1.0"
+features = ["spin_no_std"]
+```
+
+* We need the `spin_no_std` feature since we don't link the standard library
+
+* Then we can use `lazy_static` to define our static `WRITER`:
+
+```rust
+// in src/vga_buffer.rs
+
+use lazy_static::lazy_static;
+
+lazy_static! {
+    pub static ref WRITER: Writer = Writer {
+        column_position: 0,
+        color_code: ColorCode::new(Color::Yellow, Color::Black),
+        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+    };
+}
+```
+
+* But this `WRITER` is immutable, and we need it mutable to write to it. We could use a mutable static, but reads/writes would be unsafe because of potential data races. We could try using immutable statics with a `RefCell` for interior mutability. But these aren't `Sync` (types which are safe to share references between threads).
+
+### Spinlocks
+* We coud use **mutexes** for interior mutability. Threads will be blocked when the resource is already locked. But our kernel has no blocking support or even the concept of threads. So we can't use mutexes.
+* A basic kind of mutex that requires no OS features: a **spinlock**. These wait in a loop while repeatedly checking if the lock is available. These use up CPU time waiting until the mutex is free.
+* We use this crate to add safe [interior mutability](https://doc.rust-lang.org/book/ch15-05-interior-mutability.html) (allows you to mutate data even where there are immutable references to that data)
+* We add the dependency `spin = "0.5.2"`
+
+```rust
+// in src/vga_buffer.rs
+
+use spin::Mutex;
+...
+lazy_static! {
+    pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
+        column_position: 0,
+        color_code: ColorCode::new(Color::Yellow, Color::Black),
+        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+    });
+}
+```
+
+* Now we can print directly from `_start` and no longer need to call `text_print`: `vga_buffer::WRITER.lock().write_str(...).unwrap()`.
+
+### Safety
+* The only `unsafe` block we use is to create our `Buffer` reference to `0xb80000`. All other operations are safe. Since Rust uses bounds checking for array accesses by default (recall we specified the size of the buffer with `BUFFER_HEIGHT` and `BUFFER_WIDTH`), we won't accidentally write outside of the buffer. So we have a safe interface to the outside.
+
+### A println Macro
+* We have a global writer, so can use the `println` macro anywhere in the codebase. The standard library defines `println` as:
+```rust
+#[macro_export] // make the macro available to the whole crate (not just the module it is defined in) and puts it at the crate root (use std::println instead of std::macros::println)
+macro_rules! println {
+    () => (print!("\n"));
+    ($($arg:tt)*) => (print!("{}\n", format_args!($($arg)*)));
+}
+```
+
+* Then the `print!` macro is defined as:
+```rust 
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => ($crate::io::_print(format_args!($($arg)*)));
+}
+```
+* `$crate` variable ensures the macro works outside the `std` crate by expanding to `std` when used in other crates.
+* We copy these two macros, and modify them to use our own `_print` function
+
+```rust
+// in src/vga_buffer.rs
+
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => ($crate::vga_buffer::_print(format_args!($($arg)*)));
+}
+
+#[macro_export]
+macro_rules! println {
+    () => ($crate::print!("\n"));
+    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+}
+
+#[doc(hidden)]
+pub fn _print(args: fmt::Arguments) {
+    use core::fmt::Write;
+    WRITER.lock().write_fmt(args).unwrap();
+}
+```
+* We also added the `$crate` to our `println!` so we don't need to have to import the `print!` macro if we only want `println`. (The standard library `println` used `print`)
+* Since we added `#[macro_export]`, these macros are available everywhere in our crate, but also the macros are placed in the root namespace (i.e `use crate::println` and not `use crate::vga_buffers::println`)
+* Since the macros need to call `_print` from outside the module, `_print` is public. But as this is a private implementation detail, we add `doc(hidden)` attribute to hide it from documentation.
+
+* Now we can use the `println` macro in `_start`. `prinln!("HELLO FROM {}", "MACRO")`
+
+* So far we've gone from instantiating a `Writer` on every use, to having a `lazy_static` version (which still required quite a bit of boilerplate code), to using a simple macro.
+
+### Printing Panic Messages
+* We can use this macro to print panic messages. Inside our panic handler `panic(info: &PanicInfo)`, we can call `println("{}", info)`. We can then call `panic!("Some test panic!!")` to get:
+`panicked at 'Some test panic!!', src/main.rs:38:5`
